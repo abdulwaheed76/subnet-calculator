@@ -1,0 +1,129 @@
+name: CI/CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  AWS_REGION: eu-west-1
+  ECR_REPOSITORY: subnet-calculator
+  # Publish and deploy only on pushes to main, and only once AWS is set up (repo variable exists).
+  DEPLOY: ${{ github.event_name == 'push' && vars.AWS_ROLE_ARN != '' }}
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm test
+
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # lets GitHub log in to AWS with OIDC, so no AWS keys are stored
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Build image
+        run: docker build -t app:${{ github.sha }} .
+
+      - name: Scan image for vulnerabilities
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: app:${{ github.sha }}
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true # only fail on issues that have a fix available
+          exit-code: '1'
+
+      # The image pushed below is the exact one that was scanned above, not a rebuild.
+      - name: Log in to AWS
+        if: env.DEPLOY == 'true'
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Log in to ECR
+        if: env.DEPLOY == 'true'
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@7290e214a610b32bc0eef81748948b6d466a8783 # v2.2.0
+
+      - name: Push image (tagged with commit SHA)
+        if: env.DEPLOY == 'true'
+        run: |
+          IMAGE=${{ steps.ecr.outputs.registry }}/$ECR_REPOSITORY:$GITHUB_SHA
+          docker tag app:$GITHUB_SHA "$IMAGE"
+          docker push "$IMAGE"
+
+  deploy:
+    needs: build
+    if: github.event_name == 'push' && vars.AWS_ROLE_ARN != ''
+    runs-on: ubuntu-latest
+    concurrency: production # never run two deploys at the same time
+    permissions:
+      id-token: write
+    steps:
+      - name: Log in to AWS
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Roll out to servers one at a time (via SSM, no SSH)
+        run: |
+          REGISTRY=$(aws sts get-caller-identity --query Account --output text).dkr.ecr.$AWS_REGION.amazonaws.com
+          IMAGE=$REGISTRY/$ECR_REPOSITORY:$GITHUB_SHA
+
+          # Commands run on each server. \$(hostname) is escaped so it runs on the server, not here.
+          CMDS=(
+            "aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $REGISTRY"
+            "docker pull $IMAGE"
+            "docker rm -f app || true"
+            "docker run -d --name app --restart unless-stopped -p 80:3000 -e APP_VERSION=$GITHUB_SHA -e SERVER_NAME=\$(hostname) $IMAGE"
+            "docker image prune -af"
+          )
+          jq -n '{commands: $ARGS.positional}' --args "${CMDS[@]}" > params.json
+
+          CMD_ID=$(aws ssm send-command \
+            --document-name AWS-RunShellScript \
+            --targets Key=tag:App,Values=$ECR_REPOSITORY \
+            --max-concurrency 1 --max-errors 0 \
+            --parameters file://params.json \
+            --query Command.CommandId --output text)
+
+          for _ in $(seq 60); do
+            STATUS=$(aws ssm list-commands --command-id "$CMD_ID" --query 'Commands[0].Status' --output text)
+            case $STATUS in
+              Success) echo "Rolled out to all servers"; exit 0 ;;
+              Pending|InProgress) sleep 5 ;;
+              *) echo "Deploy $STATUS"
+                 aws ssm list-command-invocations --command-id "$CMD_ID" --details \
+                   --query 'CommandInvocations[].CommandPlugins[].Output' --output text
+                 exit 1 ;;
+            esac
+          done
+          echo "Deploy timed out"; exit 1
+
+      - name: Check the new version is live
+        env:
+          APP_URL: ${{ vars.APP_URL }}
+        run: |
+          # 4 requests per try so the load balancer sends at least one to each server.
+          all_new() { for _ in 1 2 3 4; do curl -fsS "$APP_URL/health" | grep -q "$GITHUB_SHA" || return 1; done; }
+          for _ in $(seq 30); do
+            all_new && { echo "Version $GITHUB_SHA is live at $APP_URL"; exit 0; }
+            sleep 5
+          done
+          echo "New version not live after 150s"; exit 1
