@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Subnet Calculator</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 40rem; margin: 2rem auto; padding: 0 1rem; }
+    input, button { font-size: 1rem; padding: 0.4rem; }
+    pre { background: #f4f4f4; padding: 1rem; overflow-x: auto; }
+  </style>
+</head>
+<body>
+  <h1>Subnet Calculator</h1>
+  <form id="form">
+    <label for="cidr">CIDR</label>
+    <input id="cidr" value="192.168.1.0/24" required>
+    <button>Calculate</button>
+  </form>
+  <pre id="result" aria-live="polite"></pre>
+  <p id="version"></p>
+
+  <script>
+    const result = document.getElementById('result');
+
+    document.getElementById('form').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const res = await fetch('/api/subnet', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ cidr: document.getElementById('cidr').value }),
+      });
+      // textContent, not innerHTML, so API output can never inject markup.
+      result.textContent = JSON.stringify(await res.json(), null, 2);
+    });
+
+    fetch('/health').then((r) => r.json()).then((h) => {
+      document.getElementById('version').textContent = `Version ${h.version} · served by ${h.server}`;
+    });
+  </script>
+</body>
+</html>
