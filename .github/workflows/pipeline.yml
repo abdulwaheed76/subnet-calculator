@@ -11,22 +11,23 @@ permissions:
 
 env:
   AWS_REGION: eu-west-1
-  ECR_REPOSITORY: subnet-calculator
-  # Publish and deploy only on pushes to main, and only once AWS is set up (repo variable exists).
+  APP_NAME: subnet-calculator
   DEPLOY: ${{ github.event_name == 'push' && vars.AWS_ROLE_ARN != '' }}
 
 jobs:
+  # ===================== JOB 1: TEST =====================
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7 # v7.1.0
         with:
           node-version: 24
           cache: npm
       - run: npm ci
       - run: npm test
 
+  # ===================== JOB 2: BUILD, SCAN, PUSH =====================
   build:
     needs: test
     runs-on: ubuntu-latest
@@ -34,7 +35,7 @@ jobs:
       contents: read
       id-token: write # lets GitHub log in to AWS with OIDC, so no AWS keys are stored
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@v7
 
       - name: Build image
         run: docker build -t app:${{ github.sha }} .
@@ -63,12 +64,16 @@ jobs:
       - name: Push image (tagged with commit SHA)
         if: env.DEPLOY == 'true'
         run: |
-          IMAGE=${{ steps.ecr.outputs.registry }}/$ECR_REPOSITORY:$GITHUB_SHA
+          # LEARN: Full image address, e.g. 983388732711.dkr.ecr.eu-west-1.amazonaws.com/subnet-calculator:<sha>
+          IMAGE=${{ steps.ecr.outputs.registry }}/$APP_NAME:$GITHUB_SHA
+          # LEARN: Give the local image its ECR name, then upload it.
           docker tag app:$GITHUB_SHA "$IMAGE"
           docker push "$IMAGE"
 
+  # ===================== JOB 3: DEPLOY TO ECS =====================
   deploy:
     needs: build
+
     if: github.event_name == 'push' && vars.AWS_ROLE_ARN != ''
     runs-on: ubuntu-latest
     concurrency: production # never run two deploys at the same time
@@ -80,47 +85,36 @@ jobs:
         with:
           role-to-assume: ${{ vars.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
+      - name: Work out the image address
+        id: image
+        run: echo "uri=$(aws sts get-caller-identity --query Account --output text).dkr.ecr.$AWS_REGION.amazonaws.com/$APP_NAME:$GITHUB_SHA" >> "$GITHUB_OUTPUT"
 
-      - name: Roll out to servers one at a time (via SSM, no SSH)
-        run: |
-          REGISTRY=$(aws sts get-caller-identity --query Account --output text).dkr.ecr.$AWS_REGION.amazonaws.com
-          IMAGE=$REGISTRY/$ECR_REPOSITORY:$GITHUB_SHA
+      - name: Put the new image into the latest task definition
+        id: render
+        uses: aws-actions/amazon-ecs-render-task-definition@8d79160660ad39c402a16e5fc7cd2a32e8f7d6b7 # v1.9.1
+        with:
+          task-definition-family: ${{ env.APP_NAME }}
+          container-name: app
+          image: ${{ steps.image.outputs.uri }}
+          environment-variables: APP_VERSION=${{ github.sha }}
 
-          # Commands run on each server. \$(hostname) is escaped so it runs on the server, not here.
-          CMDS=(
-            "aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $REGISTRY"
-            "docker pull $IMAGE"
-            "docker rm -f app || true"
-            "docker run -d --name app --restart unless-stopped -p 80:3000 -e APP_VERSION=$GITHUB_SHA -e SERVER_NAME=\$(hostname) $IMAGE"
-            "docker image prune -af"
-          )
-          jq -n '{commands: $ARGS.positional}' --args "${CMDS[@]}" > params.json
+      # ECS starts the new tasks, waits for them to pass the load balancer health check, then stops the old ones.
+      - name: Deploy to ECS and wait until the service is stable
+        uses: aws-actions/amazon-ecs-deploy-task-definition@a00d4d57ac0de1a99b39fe469f3d898d38717c2b # v2.6.4
+        with:
+          task-definition: ${{ steps.render.outputs.task-definition }}
+          cluster: ${{ env.APP_NAME }}
+          service: ${{ env.APP_NAME }}
+          # LEARN: Don't finish this step until ECS reports the rollout is done (or failed).
+          wait-for-service-stability: true
 
-          CMD_ID=$(aws ssm send-command \
-            --document-name AWS-RunShellScript \
-            --targets Key=tag:App,Values=$ECR_REPOSITORY \
-            --max-concurrency 1 --max-errors 0 \
-            --parameters file://params.json \
-            --query Command.CommandId --output text)
-
-          for _ in $(seq 60); do
-            STATUS=$(aws ssm list-commands --command-id "$CMD_ID" --query 'Commands[0].Status' --output text)
-            case $STATUS in
-              Success) echo "Rolled out to all servers"; exit 0 ;;
-              Pending|InProgress) sleep 5 ;;
-              *) echo "Deploy $STATUS"
-                 aws ssm list-command-invocations --command-id "$CMD_ID" --details \
-                   --query 'CommandInvocations[].CommandPlugins[].Output' --output text
-                 exit 1 ;;
-            esac
-          done
-          echo "Deploy timed out"; exit 1
-
+      # Also catches an automatic rollback: the service is "stable" again, but on the old version.
       - name: Check the new version is live
         env:
+          # The load balancer URL from Terraform's output, stored as a repo variable.
           APP_URL: ${{ vars.APP_URL }}
         run: |
-          # 4 requests per try so the load balancer sends at least one to each server.
+          # 4 requests per try so the load balancer sends them to different tasks.
           all_new() { for _ in 1 2 3 4; do curl -fsS "$APP_URL/health" | grep -q "$GITHUB_SHA" || return 1; done; }
           for _ in $(seq 30); do
             all_new && { echo "Version $GITHUB_SHA is live at $APP_URL"; exit 0; }
