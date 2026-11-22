@@ -10,8 +10,10 @@ terraform {
 }
 
 locals {
-  name        = "subnet-calculator" # must match APP_NAME in the pipeline (ECR repo, cluster, service, task family)
-  github_repo = "abdulwaheed76/subnet-calculator"
+  name = "subnet-calculator" # must match APP_NAME in the pipeline (ECR repo, cluster, service, task family)
+  # owner@ownerID/repo@repoID: GitHub's immutable OIDC subject, so a different repo later created
+  # with the same name can't assume the role. From: gh api repos/{owner}/{repo}/actions/oidc/customization/sub
+  github_repo = "abdulwaheed76@68082996/subnet-calculator@1466840055"
   region      = "eu-west-1" # must match AWS_REGION in the pipeline
 }
 
@@ -309,6 +311,13 @@ resource "aws_iam_role_policy" "github" {
       },
       # These two ECS actions don't support resource-level restrictions.
       { Effect = "Allow", Action = ["ecs:DescribeTaskDefinition", "ecs:RegisterTaskDefinition"], Resource = "*" },
+      # New revisions copy the Project tag; tagging on create needs TagResource. Only allowed while registering this family.
+      {
+        Effect    = "Allow"
+        Action    = "ecs:TagResource"
+        Resource  = "arn:aws:ecs:${local.region}:${data.aws_caller_identity.me.account_id}:task-definition/${local.name}:*"
+        Condition = { StringEquals = { "ecs:CreateAction" = "RegisterTaskDefinition" } }
+      },
       { Effect = "Allow", Action = ["ecs:UpdateService", "ecs:DescribeServices"], Resource = aws_ecs_service.app.id },
       {
         Effect    = "Allow"
